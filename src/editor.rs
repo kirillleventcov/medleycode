@@ -1861,24 +1861,6 @@ impl TextEditor {
         self.is_dragging = false;
     }
 
-    fn handle_tree_mouse_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        let line_height = self.line_height();
-        let click_y: f32 = event.position.y.into();
-        let click_y = click_y + self.file_tree.scroll_offset;
-        let ratio: f32 = click_y / line_height;
-        let row_idx = ratio.max(0.0_f32).floor() as usize;
-        let rows = self.file_tree.visible_rows();
-        if let Some((_, path, _, is_dir, _, _)) = rows.get(row_idx) {
-            if *is_dir {
-                self.file_tree.toggle_expand(path);
-            } else {
-                let path = path.clone();
-                self.switch_to_file(path.to_path_buf(), cx);
-            }
-        }
-        cx.notify();
-    }
-
     fn handle_tree_scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
         let line_height = self.line_height();
         let scroll_amount = match event.delta {
@@ -2617,12 +2599,6 @@ impl Render for TextEditor {
                 .flex()
                 .flex_col()
                 .overflow_hidden()
-                .on_mouse_down(
-                    gpui::MouseButton::Left,
-                    cx.listener(|editor, event: &MouseDownEvent, _, cx| {
-                        editor.handle_tree_mouse_down(event, cx);
-                    }),
-                )
                 .on_scroll_wheel(cx.listener(|editor, event: &ScrollWheelEvent, _, cx| {
                     editor.handle_tree_scroll_wheel(event, cx);
                 }))
@@ -2631,7 +2607,7 @@ impl Render for TextEditor {
                         .flex()
                         .flex_col()
                         .mt(px(-self.file_tree.scroll_offset))
-                        .children(rows.iter().map(|(depth, _path, name, is_dir, is_selected, is_expanded)| {
+                        .children(rows.iter().map(|(depth, path, name, is_dir, is_selected, is_expanded)| {
                             let indent = *depth as f32 * 12.0 + 8.0;
                             let (bg, text_color) = if *is_selected {
                                 (tree_theme.item_selected_background, tree_theme.item_selected_text)
@@ -2645,11 +2621,25 @@ impl Render for TextEditor {
                             } else {
                                 "  "
                             };
+                            let row_path = path.clone();
+                            let row_is_dir = *is_dir;
                             div()
                                 .pl(px(indent))
                                 .py(px(2.0))
                                 .bg(bg)
                                 .cursor_pointer()
+                                .on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    cx.listener(move |editor, _event, _, cx| {
+                                        editor.file_tree.select(row_path.clone());
+                                        if row_is_dir {
+                                            editor.file_tree.toggle_expand(&row_path);
+                                        } else {
+                                            editor.switch_to_file(row_path.clone(), cx);
+                                        }
+                                        cx.notify();
+                                    }),
+                                )
                                 .child(
                                     div()
                                         .text_sm()
