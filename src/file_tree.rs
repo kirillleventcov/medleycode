@@ -94,7 +94,25 @@ impl FileTree {
             self.expanded.remove(path);
         } else {
             self.expanded.insert(path.to_path_buf());
+            // Lazily load children when expanding for the first time.
+            if let Some(node) = Self::find_node_mut(&mut self.root, path) {
+                if node.children.is_empty() {
+                    node.load_children();
+                }
+            }
         }
+    }
+
+    fn find_node_mut<'a>(node: &'a mut TreeNode, target: &Path) -> Option<&'a mut TreeNode> {
+        if node.path == target {
+            return Some(node);
+        }
+        for child in &mut node.children {
+            if let Some(found) = Self::find_node_mut(child, target) {
+                return Some(found);
+            }
+        }
+        None
     }
 
     pub fn is_expanded(&self, path: &Path) -> bool {
