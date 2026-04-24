@@ -304,7 +304,7 @@ impl TextEditor {
     }
 
     fn gutter_width(&self) -> f32 {
-        let total_lines = self.content.split('\n').count();
+        let total_lines = bytecount_newlines(self.content.as_bytes()) + 1;
         (total_lines.to_string().len() as f32 * self.char_width()) + 16.0
     }
 
@@ -516,11 +516,9 @@ impl TextEditor {
     ///
     /// Counts newlines before the cursor to determine which line we're on.
     fn get_current_line_number(&self) -> usize {
-        self.content[..self.cursor_position]
-            .chars()
-            .filter(|&c| c == '\n')
-            .count()
-            + 1
+        // Byte-level newline counting is substantially faster than char iteration;
+        // `\n` is a single byte in UTF-8 so correctness is preserved.
+        bytecount_newlines(&self.content.as_bytes()[..self.cursor_position]) + 1
     }
 
     /// Gets the content of the current line up to the cursor position.
@@ -1787,32 +1785,7 @@ impl TextEditor {
     fn handle_mouse_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
         self.clear_selection();
 
-        let char_width = px(self.char_width());
-        let line_height = px(self.line_height());
-        let header_height = px(self.header_height());
-        let padding = px(self.padding());
-        let sidebar_width = px(self.sidebar_width());
-
-        let click_x = event.position.x - padding - sidebar_width;
-        let click_y = event.position.y - padding - header_height + px(self.scroll_offset);
-
-        let clicked_line = ((click_y / line_height).max(0.0).floor() as usize).max(0);
-
-        let clicked_col = ((click_x / char_width).max(0.0).round() as usize).max(0);
-
-        let lines: Vec<&str> = self.content.split('\n').collect();
-
-        let target_line = clicked_line.min(lines.len().saturating_sub(1));
-
-        let mut byte_position = 0;
-        for (idx, line) in lines.iter().enumerate() {
-            if idx == target_line {
-                let target_col = clicked_col.min(line.len());
-                byte_position += target_col;
-                break;
-            }
-            byte_position += line.len() + 1;
-        }
+        let byte_position = self.position_from_mouse(event.position);
 
         self.cursor_position = byte_position;
         self.is_dragging = true;
@@ -1826,34 +1799,51 @@ impl TextEditor {
             return;
         }
 
+        let byte_position = self.position_from_mouse(event.position);
+
+        self.cursor_position = byte_position;
+        self.selection_start = Some(self.drag_start_position);
+        cx.notify();
+    }
+
+    /// Converts a pixel position in the editor viewport to a byte offset in the content.
+    ///
+    /// Walks the content stream-wise instead of allocating a `Vec<&str>` of all lines —
+    /// important for drag-select on large files, which fires many times per second.
+    fn position_from_mouse(&self, position: gpui::Point<gpui::Pixels>) -> usize {
         let char_width = px(self.char_width());
         let line_height = px(self.line_height());
         let header_height = px(self.header_height());
         let padding = px(self.padding());
         let sidebar_width = px(self.sidebar_width());
 
-        let move_x = event.position.x - padding - sidebar_width;
-        let move_y = event.position.y - padding - header_height + px(self.scroll_offset);
+        let rel_x = position.x - padding - sidebar_width;
+        let rel_y = position.y - padding - header_height + px(self.scroll_offset);
 
-        let moved_line = ((move_y / line_height).max(0.0).floor() as usize).max(0);
-        let moved_col = ((move_x / char_width).max(0.0).round() as usize).max(0);
+        let target_line = ((rel_y / line_height).max(0.0).floor() as usize).max(0);
+        let target_col = ((rel_x / char_width).max(0.0).round() as usize).max(0);
 
-        let lines: Vec<&str> = self.content.split('\n').collect();
-        let target_line = moved_line.min(lines.len().saturating_sub(1));
+        let bytes = self.content.as_bytes();
+        let mut line_idx = 0usize;
+        let mut line_start = 0usize;
 
-        let mut byte_position = 0;
-        for (idx, line) in lines.iter().enumerate() {
-            if idx == target_line {
-                let target_col = moved_col.min(line.len());
-                byte_position += target_col;
-                break;
+        // Find the start of the target line with a single forward scan.
+        while line_idx < target_line {
+            match memchr_newline(bytes, line_start) {
+                Some(nl) => {
+                    line_start = nl + 1;
+                    line_idx += 1;
+                }
+                None => {
+                    // Clicked past EOF — clamp to the last line's start.
+                    return self.content.len();
+                }
             }
-            byte_position += line.len() + 1;
         }
 
-        self.cursor_position = byte_position;
-        self.selection_start = Some(self.drag_start_position);
-        cx.notify();
+        let line_end = memchr_newline(bytes, line_start).unwrap_or(bytes.len());
+        let line_len = line_end - line_start;
+        line_start + target_col.min(line_len)
     }
 
     /// Handles mouse up events to end drag selection.
@@ -1930,11 +1920,12 @@ impl TextEditor {
     /// Builds visual lines for word-wrapped rendering.
     fn build_visual_lines(&self) -> Vec<VisualLine> {
         let max_chars = self.chars_per_line();
-        let lines: Vec<&str> = self.content.split('\n').collect();
         let mut result = Vec::new();
         let mut content_byte = 0usize;
 
-        for (line_idx, line) in lines.iter().enumerate() {
+        for (line_idx, line) in self.content.split('\n').enumerate() {
+            let parent_line_start = content_byte;
+            let parent_line_end = content_byte + line.len();
             let mut char_count = 0usize;
             let mut start_byte = 0usize;
             let mut is_first = true;
@@ -1946,6 +1937,8 @@ impl TextEditor {
                         start_byte_in_content: content_byte + start_byte,
                         end_byte_in_content: content_byte + byte_idx,
                         is_first,
+                        parent_line_start,
+                        parent_line_end,
                     });
                     start_byte = byte_idx;
                     char_count = 0;
@@ -1959,6 +1952,8 @@ impl TextEditor {
                 start_byte_in_content: content_byte + start_byte,
                 end_byte_in_content: content_byte + line.len(),
                 is_first,
+                parent_line_start,
+                parent_line_end,
             });
 
             content_byte += line.len() + 1;
@@ -2011,6 +2006,19 @@ impl TextEditor {
     }
 }
 
+#[inline]
+fn bytecount_newlines(bytes: &[u8]) -> usize {
+    // `bytes().filter(|&b| b == b'\n').count()` gets auto-vectorized by rustc/LLVM
+    // and is dramatically faster than `chars().filter(|&c| c == '\n').count()`
+    // because it avoids UTF-8 decoding for every byte.
+    bytes.iter().filter(|&&b| b == b'\n').count()
+}
+
+#[inline]
+fn memchr_newline(bytes: &[u8], from: usize) -> Option<usize> {
+    bytes[from..].iter().position(|&b| b == b'\n').map(|p| p + from)
+}
+
 /// Represents a single visual line after word wrapping.
 #[derive(Clone, Copy)]
 struct VisualLine {
@@ -2018,6 +2026,8 @@ struct VisualLine {
     start_byte_in_content: usize,
     end_byte_in_content: usize,
     is_first: bool,
+    parent_line_start: usize,
+    parent_line_end: usize,
 }
 
 /// GPUI Focusable trait implementation for keyboard event routing.
@@ -2225,14 +2235,48 @@ impl Render for TextEditor {
                     .gap_1()
                     .flex_1()
                     .overflow_hidden()
-                    .child(div().flex().flex_col().mt(px(-self.scroll_offset)).child({
+                    // Viewport culling: only render lines visible in the scroll viewport.
+                    // Previously the entire document was materialized on every render, which
+                    // blocked the UI thread on large files.
+                    .child(div().flex().flex_col().child({
                         let selection_range = self.get_selection_range();
                         let visual_lines = self.build_visual_lines();
-                        let mut result = div().flex().flex_col();
+                        let total_lines = visual_lines.len();
                         let gutter_width = self.gutter_width();
                         let content_line_height = self.cursor_height();
+                        let line_height = self.line_height();
 
-                        for vl in visual_lines.iter() {
+                        // Viewport culling window.
+                        let viewport_h = self.window_height.max(0.0);
+                        let buffer_lines = 4usize;
+                        let max_scroll = ((total_lines as f32 * line_height) - viewport_h)
+                            .max(0.0);
+                        let scroll = self.scroll_offset.clamp(0.0, max_scroll);
+                        let first_visible =
+                            ((scroll / line_height).floor() as isize).max(0) as usize;
+                        let last_visible =
+                            ((scroll + viewport_h) / line_height).ceil() as usize + 1;
+                        let first = first_visible
+                            .saturating_sub(buffer_lines)
+                            .min(total_lines);
+                        let last = last_visible
+                            .saturating_add(buffer_lines)
+                            .min(total_lines);
+
+                        // Offset so visible rows line up despite scroll_offset.
+                        let vertical_offset = (first as f32) * line_height - scroll;
+
+                        let mut result = div()
+                            .flex()
+                            .flex_col()
+                            .mt(px(vertical_offset));
+
+                        // Reuse tokenization across wrapped visual lines that share a parent line.
+                        let mut cached_parent_start: usize = usize::MAX;
+                        let mut cached_tokens: Vec<(String, crate::markdown::MarkdownToken)> =
+                            Vec::new();
+
+                        for vl in visual_lines[first..last].iter() {
                             let mut line_wrapper =
                                 div().flex().flex_row().min_h(px(content_line_height));
 
@@ -2256,27 +2300,27 @@ impl Render for TextEditor {
                             let mut line_div =
                                 div().flex().flex_row().min_h(px(content_line_height));
 
-                            // Find parent line boundaries for tokenization
-                            let parent_line_start = self.content[..vl.start_byte_in_content]
-                                .rfind('\n')
-                                .map(|p| p + 1)
-                                .unwrap_or(0);
-                            let parent_line_end = self.content[vl.start_byte_in_content..]
-                                .find('\n')
-                                .map(|p| vl.start_byte_in_content + p)
-                                .unwrap_or(self.content.len());
-                            let parent_text = &self.content[parent_line_start..parent_line_end];
-                            let tokens = MarkdownHighlighter::tokenize_line(parent_text);
+                            // Use cached parent bounds from VisualLine (no O(n) scan per line).
+                            let parent_line_start = vl.parent_line_start;
+                            let parent_line_end = vl.parent_line_end;
+
+                            if parent_line_start != cached_parent_start {
+                                let parent_text =
+                                    &self.content[parent_line_start..parent_line_end];
+                                cached_tokens = MarkdownHighlighter::tokenize_line(parent_text);
+                                cached_parent_start = parent_line_start;
+                            }
 
                             let mut token_byte = parent_line_start;
-                            for (text, token_type) in tokens {
+                            for (text, token_type) in cached_tokens.iter() {
+                                let text_len = text.len();
                                 let token_start = token_byte;
-                                let token_end = token_byte + text.len();
+                                let token_end = token_byte + text_len;
 
                                 if token_end <= vl.start_byte_in_content
                                     || token_start >= vl.end_byte_in_content
                                 {
-                                    token_byte += text.len();
+                                    token_byte += text_len;
                                     continue;
                                 }
 
@@ -2286,7 +2330,7 @@ impl Render for TextEditor {
                                     &self.content[overlap_start..overlap_end];
 
                                 let token_color = MarkdownHighlighter::get_color(
-                                    &token_type,
+                                    token_type,
                                     &theme.syntax,
                                 );
                                 let cursor_pos =
@@ -2332,7 +2376,7 @@ impl Render for TextEditor {
                                     }
                                 }
 
-                                token_byte += text.len();
+                                token_byte += text_len;
                             }
 
                             // Cursor at end of visual line
@@ -2586,10 +2630,27 @@ impl Render for TextEditor {
             editor_container = editor_container.child(palette_entity.clone());
         }
 
-        // Build sidebar file tree
+        // Build sidebar file tree with viewport culling so deep/expanded trees don't
+        // rebuild tens of thousands of divs per render.
         let sidebar = if self.show_sidebar {
             let tree_theme = theme.file_tree.clone();
             let rows = self.file_tree.visible_rows();
+            let total_rows = rows.len();
+            let row_height = self.line_height();
+            let viewport_h = self.window_height.max(0.0);
+            let buffer = 4usize;
+            let max_tree_scroll = ((total_rows as f32 * row_height) - viewport_h).max(0.0);
+            let tree_scroll = self
+                .file_tree
+                .scroll_offset
+                .clamp(0.0, max_tree_scroll);
+            let first_row =
+                ((tree_scroll / row_height).floor() as isize).max(0) as usize;
+            let last_row = ((tree_scroll + viewport_h) / row_height).ceil() as usize + 1;
+            let first_row = first_row.saturating_sub(buffer).min(total_rows);
+            let last_row = last_row.saturating_add(buffer).min(total_rows);
+            let tree_vertical_offset = (first_row as f32) * row_height - tree_scroll;
+
             div()
                 .w(px(self.file_tree.width))
                 .h_full()
@@ -2606,48 +2667,53 @@ impl Render for TextEditor {
                     div()
                         .flex()
                         .flex_col()
-                        .mt(px(-self.file_tree.scroll_offset))
-                        .children(rows.iter().map(|(depth, path, name, is_dir, is_selected, is_expanded)| {
-                            let indent = *depth as f32 * 12.0 + 8.0;
-                            let (bg, text_color) = if *is_selected {
-                                (tree_theme.item_selected_background, tree_theme.item_selected_text)
-                            } else if *is_dir {
-                                (tree_theme.background, tree_theme.folder_text)
-                            } else {
-                                (tree_theme.background, tree_theme.item_text)
-                            };
-                            let prefix = if *is_dir {
-                                if *is_expanded { "v " } else { "> " }
-                            } else {
-                                "  "
-                            };
-                            let row_path = path.clone();
-                            let row_is_dir = *is_dir;
-                            div()
-                                .pl(px(indent))
-                                .py(px(2.0))
-                                .bg(bg)
-                                .cursor_pointer()
-                                .on_mouse_down(
-                                    gpui::MouseButton::Left,
-                                    cx.listener(move |editor, _event, _, cx| {
-                                        editor.file_tree.select(row_path.clone());
-                                        if row_is_dir {
-                                            editor.file_tree.toggle_expand(&row_path);
-                                        } else {
-                                            editor.switch_to_file(row_path.clone(), cx);
-                                        }
-                                        cx.notify();
-                                    }),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_family("monospace")
-                                        .text_color(text_color)
-                                        .child(format!("{}{}", prefix, name))
-                                )
-                        }))
+                        .mt(px(tree_vertical_offset))
+                        .children(rows[first_row..last_row].iter().map(
+                            |(depth, path, name, is_dir, is_selected, is_expanded)| {
+                                let indent = *depth as f32 * 12.0 + 8.0;
+                                let (bg, text_color) = if *is_selected {
+                                    (
+                                        tree_theme.item_selected_background,
+                                        tree_theme.item_selected_text,
+                                    )
+                                } else if *is_dir {
+                                    (tree_theme.background, tree_theme.folder_text)
+                                } else {
+                                    (tree_theme.background, tree_theme.item_text)
+                                };
+                                let prefix = if *is_dir {
+                                    if *is_expanded { "v " } else { "> " }
+                                } else {
+                                    "  "
+                                };
+                                let row_path = path.clone();
+                                let row_is_dir = *is_dir;
+                                div()
+                                    .pl(px(indent))
+                                    .h(px(row_height))
+                                    .bg(bg)
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(move |editor, _event, _, cx| {
+                                            editor.file_tree.select(row_path.clone());
+                                            if row_is_dir {
+                                                editor.file_tree.toggle_expand(&row_path);
+                                            } else {
+                                                editor.switch_to_file(row_path.clone(), cx);
+                                            }
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_family("monospace")
+                                            .text_color(text_color)
+                                            .child(format!("{}{}", prefix, name)),
+                                    )
+                            },
+                        )),
                 )
         } else {
             div().w(px(0.0))
