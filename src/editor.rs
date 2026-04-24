@@ -12,8 +12,8 @@ use gpui::{
 use crate::autocomplete::Autocomplete;
 use crate::config::{EditorConfig, Theme};
 use crate::find::{ActiveInput, FindPanelState, SearchMatch};
-use crate::markdown::MarkdownHighlighter;
 use crate::palette::Palette;
+use crate::syntax::{self, Language, LineState};
 
 // Define GPUI actions for keyboard shortcuts and user commands.
 // These actions are bound to keys in main.rs and handled by the TextEditor.
@@ -101,6 +101,10 @@ pub struct TextEditor {
     active_path: Option<std::path::PathBuf>,
     file_tree: crate::file_tree::FileTree,
     show_sidebar: bool,
+
+    // Syntax highlighting
+    language: Language,
+    line_states: Vec<LineState>,
 }
 
 #[derive(Clone)]
@@ -182,7 +186,9 @@ impl TextEditor {
             let path_buf = std::path::PathBuf::from(&path);
             if path_buf.is_dir() {
                 (
-                    String::from("Welcome to Simple Editor!\n\nSelect a file from the sidebar to start editing."),
+                    String::from(
+                        "Welcome to Simple Editor!\n\nSelect a file from the sidebar to start editing.",
+                    ),
                     None,
                     path_buf,
                 )
@@ -190,9 +196,14 @@ impl TextEditor {
                 match std::fs::read_to_string(&path) {
                     Ok(content) => {
                         println!("Loaded file: {}", path);
-                        let parent = path_buf.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| {
-                            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-                        });
+                        let parent =
+                            path_buf
+                                .parent()
+                                .map(|p| p.to_path_buf())
+                                .unwrap_or_else(|| {
+                                    std::env::current_dir()
+                                        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                                });
                         (content, Some(path), parent)
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -201,23 +212,35 @@ impl TextEditor {
                         } else {
                             println!("Created new file: {}", path);
                         }
-                        let parent = path_buf.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| {
-                            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-                        });
+                        let parent =
+                            path_buf
+                                .parent()
+                                .map(|p| p.to_path_buf())
+                                .unwrap_or_else(|| {
+                                    std::env::current_dir()
+                                        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                                });
                         (String::new(), Some(path), parent)
                     }
                     Err(e) => {
                         eprintln!("Failed to open file: {}", e);
-                        let parent = path_buf.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| {
-                            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-                        });
+                        let parent =
+                            path_buf
+                                .parent()
+                                .map(|p| p.to_path_buf())
+                                .unwrap_or_else(|| {
+                                    std::env::current_dir()
+                                        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                                });
                         (String::new(), Some(path), parent)
                     }
                 }
             }
         } else {
             (
-                String::from("Welcome to Simple Editor!\n\nSelect a file from the sidebar to start editing."),
+                String::from(
+                    "Welcome to Simple Editor!\n\nSelect a file from the sidebar to start editing.",
+                ),
                 None,
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             )
@@ -243,7 +266,7 @@ impl TextEditor {
 
         let file_tree = crate::file_tree::FileTree::new(working_dir.clone());
 
-        Self {
+        let mut editor = Self {
             content,
             cursor_position: 0,
             selection_start: None,
@@ -268,7 +291,11 @@ impl TextEditor {
             active_path,
             file_tree,
             show_sidebar: true,
-        }
+            language: Language::PlainText,
+            line_states: vec![LineState::Normal],
+        };
+        editor.recompute_language_and_line_states();
+        editor
     }
 
     fn font_size(&self) -> f32 {
@@ -309,11 +336,20 @@ impl TextEditor {
     }
 
     fn text_area_width(&self) -> f32 {
-        (self.window_width - self.padding() * 2.0 - self.gutter_width() - 8.0 - self.sidebar_width()).max(100.0)
+        (self.window_width
+            - self.padding() * 2.0
+            - self.gutter_width()
+            - 8.0
+            - self.sidebar_width())
+        .max(100.0)
     }
 
     fn sidebar_width(&self) -> f32 {
-        if self.show_sidebar { self.file_tree.width } else { 0.0 }
+        if self.show_sidebar {
+            self.file_tree.width
+        } else {
+            0.0
+        }
     }
 
     fn save_active_buffer(&mut self) {
@@ -355,6 +391,79 @@ impl TextEditor {
         self.active_path = Some(path.clone());
         self.current_file = Some(path.to_string_lossy().to_string());
         self.file_tree.ensure_visible(path);
+        self.recompute_language_and_line_states();
+    }
+
+    fn recompute_language_and_line_states(&mut self) {
+        let path_ref = self.active_path.as_deref();
+        let first_line = self.content.split('\n').next();
+        self.language = syntax::detect_language(path_ref, first_line);
+        self.line_states = syntax::recompute_all_line_states(self.language, &self.content);
+    }
+
+    fn line_index_at_byte(&self, byte: usize) -> usize {
+        let clamped = byte.min(self.content.len());
+        self.content[..clamped]
+            .as_bytes()
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count()
+    }
+
+    fn line_start_byte(&self, line_idx: usize) -> usize {
+        if line_idx == 0 {
+            return 0;
+        }
+        let mut seen = 0usize;
+        for (i, &b) in self.content.as_bytes().iter().enumerate() {
+            if b == b'\n' {
+                seen += 1;
+                if seen == line_idx {
+                    return i + 1;
+                }
+            }
+        }
+        self.content.len()
+    }
+
+    fn invalidate_highlighting_from(&mut self, start_line: usize) {
+        let num_lines = self
+            .content
+            .as_bytes()
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count()
+            + 1;
+        if self.line_states.len() != num_lines + 1 {
+            self.line_states.resize(num_lines + 1, LineState::Normal);
+        }
+        if start_line >= num_lines {
+            return;
+        }
+        let mut entry = self
+            .line_states
+            .get(start_line)
+            .copied()
+            .unwrap_or_default();
+        let mut byte = self.line_start_byte(start_line);
+        for line_idx in start_line..num_lines {
+            let end = self.content[byte..]
+                .find('\n')
+                .map(|n| byte + n)
+                .unwrap_or(self.content.len());
+            let line = &self.content[byte..end];
+            let (_, exit) = syntax::tokenize_line(self.language, line, entry);
+            let next_slot = line_idx + 1;
+            if line_idx != start_line && self.line_states[next_slot] == exit {
+                return;
+            }
+            self.line_states[next_slot] = exit;
+            entry = exit;
+            byte = end + 1;
+            if byte > self.content.len() {
+                break;
+            }
+        }
     }
 
     fn switch_to_file(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
@@ -1033,11 +1142,13 @@ impl TextEditor {
         let old_selection = self.selection_start;
 
         self.delete_selection();
+        let first_dirty = self.line_index_at_byte(self.cursor_position);
         self.content.insert(self.cursor_position, c);
         self.cursor_position += 1;
         self.is_dirty = true;
 
         self.push_edit(old_content, old_cursor, old_selection);
+        self.invalidate_highlighting_from(first_dirty);
 
         // Check if this character should trigger autocomplete
         let trigger = c.to_string();
@@ -1072,6 +1183,11 @@ impl TextEditor {
         let old_content = self.content.clone();
         let old_cursor = self.cursor_position;
         let old_selection = self.selection_start;
+        let first_dirty_candidate = self
+            .get_selection_range()
+            .map(|(start, _)| start)
+            .unwrap_or(self.cursor_position.saturating_sub(1));
+        let first_dirty = self.line_index_at_byte(first_dirty_candidate);
 
         if !self.delete_selection() {
             if self.cursor_position > 0 {
@@ -1086,6 +1202,7 @@ impl TextEditor {
         }
 
         self.push_edit(old_content, old_cursor, old_selection);
+        self.invalidate_highlighting_from(first_dirty);
         self.refresh_search_matches();
         cx.notify();
     }
@@ -1102,6 +1219,11 @@ impl TextEditor {
         let old_content = self.content.clone();
         let old_cursor = self.cursor_position;
         let old_selection = self.selection_start;
+        let first_dirty_candidate = self
+            .get_selection_range()
+            .map(|(start, _)| start)
+            .unwrap_or(self.cursor_position);
+        let first_dirty = self.line_index_at_byte(first_dirty_candidate);
 
         if !self.delete_selection() {
             if self.cursor_position < self.content.len() {
@@ -1115,6 +1237,7 @@ impl TextEditor {
         }
 
         self.push_edit(old_content, old_cursor, old_selection);
+        self.invalidate_highlighting_from(first_dirty);
         self.refresh_search_matches();
         cx.notify();
     }
@@ -1131,6 +1254,11 @@ impl TextEditor {
         let old_content = self.content.clone();
         let old_cursor = self.cursor_position;
         let old_selection = self.selection_start;
+        let first_dirty = self.line_index_at_byte(
+            self.get_selection_range()
+                .map(|(s, _)| s)
+                .unwrap_or(old_cursor),
+        );
 
         // If autocomplete is active, accept the selected suggestion
         if let Some(autocomplete) = &self.autocomplete {
@@ -1147,6 +1275,7 @@ impl TextEditor {
                 self.cursor_position = line_start + suggestion.insert_text.len();
                 self.is_dirty = true;
                 self.push_edit(old_content, old_cursor, old_selection);
+                self.invalidate_highlighting_from(first_dirty);
             }
             self.autocomplete = None;
             self.refresh_search_matches();
@@ -1166,6 +1295,7 @@ impl TextEditor {
                 self.cursor_position = line_start;
                 self.is_dirty = true;
                 self.push_edit(old_content, old_cursor, old_selection);
+                self.invalidate_highlighting_from(first_dirty);
                 self.refresh_search_matches();
                 cx.notify();
                 return;
@@ -1177,6 +1307,7 @@ impl TextEditor {
                 self.cursor_position = line_start;
                 self.is_dirty = true;
                 self.push_edit(old_content, old_cursor, old_selection);
+                self.invalidate_highlighting_from(first_dirty);
                 self.refresh_search_matches();
                 cx.notify();
                 return;
@@ -1188,6 +1319,7 @@ impl TextEditor {
                 self.cursor_position = line_start;
                 self.is_dirty = true;
                 self.push_edit(old_content, old_cursor, old_selection);
+                self.invalidate_highlighting_from(first_dirty);
                 self.refresh_search_matches();
                 cx.notify();
                 return;
@@ -1199,6 +1331,7 @@ impl TextEditor {
                 self.cursor_position = line_start;
                 self.is_dirty = true;
                 self.push_edit(old_content, old_cursor, old_selection);
+                self.invalidate_highlighting_from(first_dirty);
                 self.refresh_search_matches();
                 cx.notify();
                 return;
@@ -1210,6 +1343,7 @@ impl TextEditor {
                 self.cursor_position = line_start;
                 self.is_dirty = true;
                 self.push_edit(old_content, old_cursor, old_selection);
+                self.invalidate_highlighting_from(first_dirty);
                 self.refresh_search_matches();
                 cx.notify();
                 return;
@@ -1259,6 +1393,7 @@ impl TextEditor {
 
         self.is_dirty = true;
         self.push_edit(old_content, old_cursor, old_selection);
+        self.invalidate_highlighting_from(first_dirty);
         self.refresh_search_matches();
         cx.notify();
     }
@@ -1274,11 +1409,22 @@ impl TextEditor {
         let old_content = self.content.clone();
         let old_cursor = self.cursor_position;
         let old_selection = self.selection_start;
+        let first_dirty = self.line_index_at_byte(
+            self.get_selection_range()
+                .map(|(s, _)| s)
+                .unwrap_or(old_cursor),
+        );
 
         if let Some((sel_start, sel_end)) = self.get_selection_range() {
             // Multi-line indent: find line starts in selection and indent each
-            let start_line = self.content[..sel_start].rfind('\n').map(|p| p + 1).unwrap_or(0);
-            let _end_line = self.content[..sel_end].rfind('\n').map(|p| p + 1).unwrap_or(0);
+            let start_line = self.content[..sel_start]
+                .rfind('\n')
+                .map(|p| p + 1)
+                .unwrap_or(0);
+            let _end_line = self.content[..sel_end]
+                .rfind('\n')
+                .map(|p| p + 1)
+                .unwrap_or(0);
 
             let mut insertions = Vec::new();
             let mut pos = start_line;
@@ -1303,7 +1449,12 @@ impl TextEditor {
 
             self.cursor_position = old_cursor + if old_cursor >= start_line { 2 } else { 0 };
             if let Some(ref mut sel) = self.selection_start {
-                *sel = old_selection.unwrap() + if old_selection.unwrap() >= start_line { 2 } else { 0 };
+                *sel = old_selection.unwrap()
+                    + if old_selection.unwrap() >= start_line {
+                        2
+                    } else {
+                        0
+                    };
             }
             // Adjust selection end
             let sel_end_new = sel_end + shift;
@@ -1311,6 +1462,7 @@ impl TextEditor {
             self.cursor_position = sel_end_new;
             self.is_dirty = true;
             self.push_edit(old_content, old_cursor, old_selection);
+            self.invalidate_highlighting_from(first_dirty);
             self.refresh_search_matches();
             cx.notify();
             return;
@@ -1321,6 +1473,7 @@ impl TextEditor {
         self.cursor_position += 2;
         self.is_dirty = true;
         self.push_edit(old_content, old_cursor, old_selection);
+        self.invalidate_highlighting_from(first_dirty);
         self.refresh_search_matches();
         cx.notify();
     }
@@ -1336,14 +1489,25 @@ impl TextEditor {
         let old_content = self.content.clone();
         let old_cursor = self.cursor_position;
         let old_selection = self.selection_start;
+        let first_dirty = self.line_index_at_byte(
+            self.get_selection_range()
+                .map(|(s, _)| s)
+                .unwrap_or_else(|| self.find_line_start()),
+        );
 
         if let Some((sel_start, sel_end)) = self.get_selection_range() {
-            let start_line = self.content[..sel_start].rfind('\n').map(|p| p + 1).unwrap_or(0);
+            let start_line = self.content[..sel_start]
+                .rfind('\n')
+                .map(|p| p + 1)
+                .unwrap_or(0);
 
             let mut removals = Vec::new();
             let mut pos = start_line;
             while pos <= sel_end && pos < self.content.len() {
-                let line_end = self.content[pos..].find('\n').map(|p| pos + p).unwrap_or(self.content.len());
+                let line_end = self.content[pos..]
+                    .find('\n')
+                    .map(|p| pos + p)
+                    .unwrap_or(self.content.len());
                 let line_text = &self.content[pos..line_end];
                 let spaces = line_text.chars().take_while(|c| *c == ' ').count();
                 let remove = spaces.min(2);
@@ -1355,17 +1519,20 @@ impl TextEditor {
 
             let mut shift = 0;
             for &(remove_pos, remove_count) in removals.iter().rev() {
-                self.content.drain(remove_pos + shift..remove_pos + shift + remove_count);
+                self.content
+                    .drain(remove_pos + shift..remove_pos + shift + remove_count);
                 shift -= remove_count;
             }
 
-            self.cursor_position = old_cursor.saturating_sub(if old_cursor > start_line { 2 } else { 0 });
+            self.cursor_position =
+                old_cursor.saturating_sub(if old_cursor > start_line { 2 } else { 0 });
             if let Some(ref mut sel) = self.selection_start {
                 let old = old_selection.unwrap();
                 *sel = old.saturating_sub(if old > start_line { 2 } else { 0 });
             }
             self.is_dirty = true;
             self.push_edit(old_content, old_cursor, old_selection);
+            self.invalidate_highlighting_from(first_dirty);
             self.refresh_search_matches();
             cx.notify();
             return;
@@ -1381,9 +1548,11 @@ impl TextEditor {
             .min(2);
         if spaces_before > 0 {
             self.cursor_position -= spaces_before;
-            self.content.drain(self.cursor_position..self.cursor_position + spaces_before);
+            self.content
+                .drain(self.cursor_position..self.cursor_position + spaces_before);
             self.is_dirty = true;
             self.push_edit(old_content, old_cursor, old_selection);
+            self.invalidate_highlighting_from(first_dirty);
             self.refresh_search_matches();
             cx.notify();
         }
@@ -1548,12 +1717,18 @@ impl TextEditor {
                 let old_content = self.content.clone();
                 let old_cursor = self.cursor_position;
                 let old_selection = self.selection_start;
+                let first_dirty_candidate = self
+                    .get_selection_range()
+                    .map(|(s, _)| s)
+                    .unwrap_or(self.cursor_position);
+                let first_dirty = self.line_index_at_byte(first_dirty_candidate);
 
                 self.delete_selection();
                 self.content.insert_str(self.cursor_position, &text);
                 self.cursor_position += text.len();
                 self.is_dirty = true;
                 self.push_edit(old_content, old_cursor, old_selection);
+                self.invalidate_highlighting_from(first_dirty);
                 self.refresh_search_matches();
                 cx.notify();
             }
@@ -1567,11 +1742,17 @@ impl TextEditor {
             let old_content = self.content.clone();
             let old_cursor = self.cursor_position;
             let old_selection = self.selection_start;
+            let first_dirty = self.line_index_at_byte(
+                self.get_selection_range()
+                    .map(|(s, _)| s)
+                    .unwrap_or(old_cursor),
+            );
 
             cx.write_to_clipboard(ClipboardItem::new_string(text));
             self.delete_selection();
             self.is_dirty = true;
             self.push_edit(old_content, old_cursor, old_selection);
+            self.invalidate_highlighting_from(first_dirty);
             self.refresh_search_matches();
             cx.notify();
         }
@@ -1703,6 +1884,7 @@ impl TextEditor {
             self.selection_start = operation.old_selection;
             self.redo_stack.push(operation);
             self.is_dirty = true;
+            self.invalidate_highlighting_from(0);
             self.refresh_search_matches();
             cx.notify();
         }
@@ -1717,6 +1899,7 @@ impl TextEditor {
             self.selection_start = operation.new_selection;
             self.undo_stack.push(operation);
             self.is_dirty = true;
+            self.invalidate_highlighting_from(0);
             self.refresh_search_matches();
             cx.notify();
         }
@@ -2016,7 +2199,10 @@ fn bytecount_newlines(bytes: &[u8]) -> usize {
 
 #[inline]
 fn memchr_newline(bytes: &[u8], from: usize) -> Option<usize> {
-    bytes[from..].iter().position(|&b| b == b'\n').map(|p| p + from)
+    bytes[from..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|p| p + from)
 }
 
 /// Represents a single visual line after word wrapping.
@@ -2249,32 +2435,23 @@ impl Render for TextEditor {
                         // Viewport culling window.
                         let viewport_h = self.window_height.max(0.0);
                         let buffer_lines = 4usize;
-                        let max_scroll = ((total_lines as f32 * line_height) - viewport_h)
-                            .max(0.0);
+                        let max_scroll = ((total_lines as f32 * line_height) - viewport_h).max(0.0);
                         let scroll = self.scroll_offset.clamp(0.0, max_scroll);
                         let first_visible =
                             ((scroll / line_height).floor() as isize).max(0) as usize;
                         let last_visible =
                             ((scroll + viewport_h) / line_height).ceil() as usize + 1;
-                        let first = first_visible
-                            .saturating_sub(buffer_lines)
-                            .min(total_lines);
-                        let last = last_visible
-                            .saturating_add(buffer_lines)
-                            .min(total_lines);
+                        let first = first_visible.saturating_sub(buffer_lines).min(total_lines);
+                        let last = last_visible.saturating_add(buffer_lines).min(total_lines);
 
                         // Offset so visible rows line up despite scroll_offset.
                         let vertical_offset = (first as f32) * line_height - scroll;
 
-                        let mut result = div()
-                            .flex()
-                            .flex_col()
-                            .mt(px(vertical_offset));
+                        let mut result = div().flex().flex_col().mt(px(vertical_offset));
 
                         // Reuse tokenization across wrapped visual lines that share a parent line.
                         let mut cached_parent_start: usize = usize::MAX;
-                        let mut cached_tokens: Vec<(String, crate::markdown::MarkdownToken)> =
-                            Vec::new();
+                        let mut cached_tokens: Vec<(String, crate::syntax::Token)> = Vec::new();
 
                         for vl in visual_lines[first..last].iter() {
                             let mut line_wrapper =
@@ -2292,9 +2469,7 @@ impl Render for TextEditor {
                                         .child(format!("{}", vl.content_line + 1)),
                                 );
                             } else {
-                                line_wrapper = line_wrapper.child(
-                                    div().w(px(gutter_width)),
-                                );
+                                line_wrapper = line_wrapper.child(div().w(px(gutter_width)));
                             }
 
                             let mut line_div =
@@ -2305,9 +2480,19 @@ impl Render for TextEditor {
                             let parent_line_end = vl.parent_line_end;
 
                             if parent_line_start != cached_parent_start {
-                                let parent_text =
-                                    &self.content[parent_line_start..parent_line_end];
-                                cached_tokens = MarkdownHighlighter::tokenize_line(parent_text);
+                                let parent_text = &self.content[parent_line_start..parent_line_end];
+                                let parent_line_idx = self.line_index_at_byte(parent_line_start);
+                                let entry_state = self
+                                    .line_states
+                                    .get(parent_line_idx)
+                                    .copied()
+                                    .unwrap_or_default();
+                                let (new_tokens, _exit) = crate::syntax::tokenize_line(
+                                    self.language,
+                                    parent_text,
+                                    entry_state,
+                                );
+                                cached_tokens = new_tokens;
                                 cached_parent_start = parent_line_start;
                             }
 
@@ -2326,21 +2511,16 @@ impl Render for TextEditor {
 
                                 let overlap_start = token_start.max(vl.start_byte_in_content);
                                 let overlap_end = token_end.min(vl.end_byte_in_content);
-                                let overlap_text =
-                                    &self.content[overlap_start..overlap_end];
+                                let overlap_text = &self.content[overlap_start..overlap_end];
 
-                                let token_color = MarkdownHighlighter::get_color(
-                                    token_type,
-                                    &theme.syntax,
-                                );
-                                let cursor_pos =
-                                    if self.cursor_position >= overlap_start
-                                        && self.cursor_position <= overlap_end
-                                    {
-                                        Some(self.cursor_position)
-                                    } else {
-                                        None
-                                    };
+                                let token_color = theme.color_for_token(token_type);
+                                let cursor_pos = if self.cursor_position >= overlap_start
+                                    && self.cursor_position <= overlap_end
+                                {
+                                    Some(self.cursor_position)
+                                } else {
+                                    None
+                                };
 
                                 let segments = self.build_segments_for_token(
                                     overlap_text,
@@ -2366,8 +2546,7 @@ impl Render for TextEditor {
                                             if run.text.is_empty() {
                                                 continue;
                                             }
-                                            let mut node =
-                                                div().text_color(run.text_color);
+                                            let mut node = div().text_color(run.text_color);
                                             if let Some(bg) = run.background {
                                                 node = node.bg(bg);
                                             }
@@ -2418,7 +2597,12 @@ impl Render for TextEditor {
             );
 
         // Wrap in a container and add overlays (autocomplete and/or palette)
-        let mut editor_container = div().flex().flex_col().flex_1().size_full().child(editor_content);
+        let mut editor_container = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .size_full()
+            .child(editor_content);
 
         if let Some(find_panel) = &self.find_panel {
             let build_row = |label: &str, value: &str, placeholder: &str, active: bool| {
@@ -2640,12 +2824,8 @@ impl Render for TextEditor {
             let viewport_h = self.window_height.max(0.0);
             let buffer = 4usize;
             let max_tree_scroll = ((total_rows as f32 * row_height) - viewport_h).max(0.0);
-            let tree_scroll = self
-                .file_tree
-                .scroll_offset
-                .clamp(0.0, max_tree_scroll);
-            let first_row =
-                ((tree_scroll / row_height).floor() as isize).max(0) as usize;
+            let tree_scroll = self.file_tree.scroll_offset.clamp(0.0, max_tree_scroll);
+            let first_row = ((tree_scroll / row_height).floor() as isize).max(0) as usize;
             let last_row = ((tree_scroll + viewport_h) / row_height).ceil() as usize + 1;
             let first_row = first_row.saturating_sub(buffer).min(total_rows);
             let last_row = last_row.saturating_add(buffer).min(total_rows);
@@ -2719,6 +2899,11 @@ impl Render for TextEditor {
             div().w(px(0.0))
         };
 
-        div().flex().flex_row().size_full().child(sidebar).child(editor_container)
+        div()
+            .flex()
+            .flex_row()
+            .size_full()
+            .child(sidebar)
+            .child(editor_container)
     }
 }

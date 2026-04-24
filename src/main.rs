@@ -9,8 +9,8 @@ mod config;
 mod editor;
 mod file_tree;
 mod find;
-mod markdown;
 mod palette;
+mod syntax;
 
 use config::EditorConfig;
 use editor::TextEditor;
@@ -31,10 +31,10 @@ fn main() {
 
     Application::new().run(move |cx: &mut App| {
         use editor::{
-            Backspace, Copy, Cut, Delete, Enter, FindNext, FindPrevious, MoveDown,
-            MoveEnd, MoveHome, MoveLeft, MoveRight, MoveUp, MoveWordLeft, MoveWordRight, Paste,
-            Quit, Redo, Save, SelectAll, SelectDown, SelectLeft, SelectRight, SelectUp, ShiftTab,
-            Tab, ToggleFind, ToggleGoToLine, TogglePalette, ToggleSidebar, Undo,
+            Backspace, Copy, Cut, Delete, Enter, FindNext, FindPrevious, MoveDown, MoveEnd,
+            MoveHome, MoveLeft, MoveRight, MoveUp, MoveWordLeft, MoveWordRight, Paste, Quit, Redo,
+            Save, SelectAll, SelectDown, SelectLeft, SelectRight, SelectUp, ShiftTab, Tab,
+            ToggleFind, ToggleGoToLine, TogglePalette, ToggleSidebar, Undo,
         };
 
         cx.bind_keys([

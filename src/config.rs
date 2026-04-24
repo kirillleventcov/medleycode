@@ -81,10 +81,37 @@ pub struct Theme {
     pub palette: PaletteTheme,
     pub autocomplete: AutocompleteTheme,
     pub syntax: SyntaxTheme,
+    pub code_syntax: CodeSyntaxTheme,
     pub file_tree: FileTreeTheme,
 }
 
 impl Theme {
+    pub fn color_for_token(&self, token: &crate::syntax::Token) -> Rgba {
+        use crate::syntax::Token;
+        match token {
+            Token::Keyword => self.code_syntax.keyword,
+            Token::String => self.code_syntax.string,
+            Token::Number => self.code_syntax.number,
+            Token::Comment => self.code_syntax.comment,
+            Token::Punctuation => self.code_syntax.punctuation,
+            Token::Operator => self.code_syntax.operator,
+            Token::Type => self.code_syntax.r#type,
+            Token::Function => self.code_syntax.function,
+            Token::Constant => self.code_syntax.constant,
+            Token::Normal => self.editor.text,
+            Token::MdHeading(level) => self.syntax.heading_color(*level as usize),
+            Token::MdBold => self.syntax.bold,
+            Token::MdItalic => self.syntax.italic,
+            Token::MdCode => self.syntax.code,
+            Token::MdLink => self.syntax.link,
+            Token::MdList => self.syntax.list,
+            Token::MdCheckboxChecked => self.syntax.checkbox_checked,
+            Token::MdCheckboxUnchecked => self.syntax.checkbox_unchecked,
+            Token::MdBlockquote => self.syntax.blockquote,
+            Token::MdCodeBlock => self.syntax.code_block,
+        }
+    }
+
     fn preset(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "default" | "dark" | "medley" => Some(Self::default()),
@@ -97,6 +124,13 @@ impl Theme {
     }
 
     pub fn apply_override(&mut self, key: &str, value: &str) {
+        if let Some(rest) = key.strip_prefix("theme.syntax.code.") {
+            if let Some(color) = parse_color(value) {
+                self.code_syntax.apply_override(rest, color);
+            }
+            return;
+        }
+
         if key.starts_with("theme.syntax.") {
             if let Some(color) = parse_color(value) {
                 let token = &key["theme.syntax.".len()..];
@@ -185,9 +219,7 @@ impl Theme {
             "theme.file-tree.background" | "theme.file_tree.background" => {
                 self.file_tree.background = color
             }
-            "theme.file-tree.border" | "theme.file_tree.border" => {
-                self.file_tree.border = color
-            }
+            "theme.file-tree.border" | "theme.file_tree.border" => self.file_tree.border = color,
             "theme.file-tree.item-text" | "theme.file_tree.item_text" => {
                 self.file_tree.item_text = color
             }
@@ -254,6 +286,7 @@ impl Theme {
                 label_text: rgb(0xf9e2af),
             },
             syntax: SyntaxTheme::catppuccin_mocha(),
+            code_syntax: CodeSyntaxTheme::catppuccin_mocha(),
             file_tree: FileTreeTheme::catppuccin_mocha(),
         }
     }
@@ -306,6 +339,7 @@ impl Theme {
                 label_text: rgb(0xfe640b),
             },
             syntax: SyntaxTheme::catppuccin_latte(),
+            code_syntax: CodeSyntaxTheme::catppuccin_latte(),
             file_tree: FileTreeTheme::catppuccin_latte(),
         }
     }
@@ -358,6 +392,7 @@ impl Theme {
                 label_text: rgb(0xf2d5cf),
             },
             syntax: SyntaxTheme::catppuccin_frappe(),
+            code_syntax: CodeSyntaxTheme::catppuccin_frappe(),
             file_tree: FileTreeTheme::catppuccin_frappe(),
         }
     }
@@ -410,6 +445,7 @@ impl Theme {
                 label_text: rgb(0xf4dea4),
             },
             syntax: SyntaxTheme::catppuccin_macchiato(),
+            code_syntax: CodeSyntaxTheme::catppuccin_macchiato(),
             file_tree: FileTreeTheme::catppuccin_macchiato(),
         }
     }
@@ -464,6 +500,7 @@ impl Default for Theme {
                 label_text: rgb(0x808080),
             },
             syntax: SyntaxTheme::default(),
+            code_syntax: CodeSyntaxTheme::default(),
             file_tree: FileTreeTheme::default(),
         }
     }
@@ -681,6 +718,115 @@ impl Default for SyntaxTheme {
             checkbox_unchecked: rgb(0xF48771),
             blockquote: rgb(0x6A9955),
             code_block: rgb(0xD16969),
+            normal: rgb(0xD4D4D4),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CodeSyntaxTheme {
+    pub keyword: Rgba,
+    pub string: Rgba,
+    pub number: Rgba,
+    pub comment: Rgba,
+    pub punctuation: Rgba,
+    pub operator: Rgba,
+    pub r#type: Rgba,
+    pub function: Rgba,
+    pub constant: Rgba,
+    pub normal: Rgba,
+}
+
+impl CodeSyntaxTheme {
+    fn apply_override(&mut self, token: &str, color: Rgba) {
+        match token {
+            "keyword" => self.keyword = color,
+            "string" => self.string = color,
+            "number" => self.number = color,
+            "comment" => self.comment = color,
+            "punctuation" => self.punctuation = color,
+            "operator" => self.operator = color,
+            "type" => self.r#type = color,
+            "function" => self.function = color,
+            "constant" => self.constant = color,
+            "normal" => self.normal = color,
+            _ => {}
+        }
+    }
+
+    fn catppuccin_mocha() -> Self {
+        Self {
+            keyword: rgb(0xcba6f7),
+            string: rgb(0xa6e3a1),
+            number: rgb(0xfab387),
+            comment: rgb(0x6c7086),
+            punctuation: rgb(0xbac2de),
+            operator: rgb(0x94e2d5),
+            r#type: rgb(0xf9e2af),
+            function: rgb(0x89b4fa),
+            constant: rgb(0xfab387),
+            normal: rgb(0xcdd6f4),
+        }
+    }
+
+    fn catppuccin_latte() -> Self {
+        Self {
+            keyword: rgb(0x8839ef),
+            string: rgb(0x40a02b),
+            number: rgb(0xfe640b),
+            comment: rgb(0x9ca0b0),
+            punctuation: rgb(0x5c5f77),
+            operator: rgb(0x179299),
+            r#type: rgb(0xdf8e1d),
+            function: rgb(0x1e66f5),
+            constant: rgb(0xfe640b),
+            normal: rgb(0x4c4f69),
+        }
+    }
+
+    fn catppuccin_frappe() -> Self {
+        Self {
+            keyword: rgb(0xca9ee6),
+            string: rgb(0xa6d189),
+            number: rgb(0xef9f76),
+            comment: rgb(0x737994),
+            punctuation: rgb(0xb5bfe2),
+            operator: rgb(0x81c8be),
+            r#type: rgb(0xe5c890),
+            function: rgb(0x8caaee),
+            constant: rgb(0xef9f76),
+            normal: rgb(0xc6d0f5),
+        }
+    }
+
+    fn catppuccin_macchiato() -> Self {
+        Self {
+            keyword: rgb(0xc6a0f6),
+            string: rgb(0xa6da95),
+            number: rgb(0xf5a97f),
+            comment: rgb(0x6e738d),
+            punctuation: rgb(0xb8c0e0),
+            operator: rgb(0x8bd5ca),
+            r#type: rgb(0xeed49f),
+            function: rgb(0x8aadf4),
+            constant: rgb(0xf5a97f),
+            normal: rgb(0xcad3f5),
+        }
+    }
+}
+
+impl Default for CodeSyntaxTheme {
+    fn default() -> Self {
+        Self {
+            keyword: rgb(0xC586C0),
+            string: rgb(0xCE9178),
+            number: rgb(0xB5CEA8),
+            comment: rgb(0x6A9955),
+            punctuation: rgb(0xD4D4D4),
+            operator: rgb(0xD4D4D4),
+            r#type: rgb(0x4EC9B0),
+            function: rgb(0xDCDCAA),
+            constant: rgb(0x569CD6),
             normal: rgb(0xD4D4D4),
         }
     }

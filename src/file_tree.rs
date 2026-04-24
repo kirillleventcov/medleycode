@@ -225,7 +225,14 @@ impl FileTree {
     ) {
         let is_selected = self.selected_path.as_ref() == Some(&node.path);
         let is_expanded = self.expanded.contains(&node.path);
-        rows.push((depth, node.path.clone(), node.name.clone(), node.is_dir, is_selected, is_expanded));
+        rows.push((
+            depth,
+            node.path.clone(),
+            node.name.clone(),
+            node.is_dir,
+            is_selected,
+            is_expanded,
+        ));
         if is_expanded {
             for child in &node.children {
                 self.rows_for_node(child, depth + 1, rows);
